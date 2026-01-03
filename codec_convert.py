@@ -87,21 +87,29 @@ def filter_existing(files: Iterator[tuple[str, str]]) -> Iterator[tuple[str, str
     return filter(f, files)
 
 
-def filter_h264(files: Iterator[tuple[str, str]]) -> Iterator[tuple[str, str]]:
+def filter_by_source_codec(
+    source_codec: str, files: Iterator[tuple[str, str]]
+) -> Iterator[tuple[str, str]]:
+    codec_human_name: dict[str, str] = {
+        "h264": "H.264",
+        "libx265": "H.265",
+    }
+
     def is_h264(file: str) -> bool:
         info(f"reading encoding on {file}")
         try:
             is_h264 = any(
-                s.get("codec_type") == "video"
-                and s.get("codec_name") == SOURCE_ENCODING
+                s.get("codec_type") == "video" and s.get("codec_name") == source_codec
                 for s in ffmpeg.probe(file)["streams"]
             )
             if not is_h264:
-                verbose(f"skipping {file}: not {SOURCE_ENCODING_HUMAN_NAME} encoded.")
+                verbose(
+                    f"skipping {file}: not {codec_human_name.get(source_codec, source_codec)} encoded."
+                )
             return is_h264
 
         except ffmpeg.Error as e:
-            error(f"error on reading codec on file {file}: {e}")
+            error(f"error on reading codec on file {file}: {e.stderr}")
             return False
 
     return filter(lambda f: is_h264(f[0]), files)
@@ -118,10 +126,64 @@ def generate_output_path(
     return map(lambda f: (f, output_path(f)), files)
 
 
+def generate_output_path_tmp(output_path: str) -> str:
+    output_file_path = pathlib.Path(output_path)
+    return str(output_file_path.with_suffix(".tmp" + output_file_path.suffix))
+
+
+def spawn_ffmpeg_cpu(
+    input_file: str, output_file: str, target_codec: str
+) -> tuple[Popen, str]:
+    output_file_tmp = generate_output_path_tmp(output_file)
+    return (
+        ffmpeg.input(input_file)
+        .output(
+            output_file_tmp,
+            vcodec=target_codec,
+            acodec="copy",
+            # quality="speed",
+            vf=f"fps={str(FPS)}",
+        )
+        .global_args("-hide_banner")
+        .run_async(
+            quiet=True,
+            pipe_stdout=True,
+            pipe_stderr=True,
+            overwrite_output=True,
+        )
+    ), output_file_tmp
+
+
+def spawn_ffmpeg_gpu(
+    input_file: str, output_file: str, target_codec: str
+) -> tuple[Popen, str]:
+    output_file_tmp = generate_output_path_tmp(output_file)
+    return (
+        ffmpeg.input(input_file)
+        .output(
+            output_file_tmp,
+            vcodec=target_codec,
+            acodec="copy",
+            # quality="speed",
+            vf=f"fps={str(FPS)},format=nv12,hwupload",
+            # **{"vf": "format=nv12,hwupload"} if HWACCEL else {},
+        )
+        .global_args("-hide_banner", *HWACCEL_CONFIG)
+        #         "-vaapi_device", "/dev/dri/renderD128",
+        # "-vf", "format=nv12,hwupload"
+        .run_async(
+            quiet=True,
+            pipe_stdout=True,
+            pipe_stderr=True,
+            overwrite_output=True,
+        )
+    ), output_file_tmp
+
+
 # consumer
 def transcode(
     total_files: int,
-    # skip_existing: bool,
+    target_codec: str,
     batch_size: int,
     files: Iterator[tuple[str, str]],
 ) -> bool:
@@ -131,7 +193,6 @@ def transcode(
     failed: int = 0
     batches = itertools.batched(files, batch_size)
     batch_count = ceil(total_files / batch_size)
-    # batch_n = 0
     info(f"processing {total_files} files")
     for batch_n, batch in enumerate(batches):
         print(f"batch ({batch_n}/{batch_count})")
@@ -149,26 +210,37 @@ def transcode(
 
             info(f"[batch {batch_n}]: processing {input_file}")
             makedirs(path.dirname(output_file), exist_ok=True)
-            subproc: Popen = (
-                ffmpeg.input(input_file)
-                .output(
-                    output_file_tmp,
-                    vcodec=TARGET_ENCODING,
-                    acodec="copy",
-                    quality="speed",
-                    vf=f"fps={str(FPS)}" + (",format=nv12,hwupload" if HWACCEL else ""),
-                    # **{"vf": "format=nv12,hwupload"} if HWACCEL else {},
+            use_gpu = False
+            subproc: Popen
+            output_file_tmp: str
+            if use_gpu:
+                subproc, output_file_tmp = spawn_ffmpeg_gpu(
+                    input_file, output_file, target_codec
                 )
-                .global_args("-hide_banner", *HWACCEL_CONFIG)
-                #         "-vaapi_device", "/dev/dri/renderD128",
-                # "-vf", "format=nv12,hwupload"
-                .run_async(
-                    quiet=True,
-                    pipe_stdout=True,
-                    pipe_stderr=True,
-                    overwrite_output=True,
+            else:
+                subproc, output_file_tmp = spawn_ffmpeg_cpu(
+                    input_file, output_file, target_codec
                 )
-            )
+            # subproc: Popen = (
+            #     ffmpeg.input(input_file)
+            #     .output(
+            #         output_file_tmp,
+            #         vcodec=TARGET_ENCODING,
+            #         acodec="copy",
+            #         quality="speed",
+            #         vf=f"fps={str(FPS)}" + (",format=nv12,hwupload" if HWACCEL else ""),
+            #         # **{"vf": "format=nv12,hwupload"} if HWACCEL else {},
+            #     )
+            #     .global_args("-hide_banner", *HWACCEL_CONFIG)
+            #     #         "-vaapi_device", "/dev/dri/renderD128",
+            #     # "-vf", "format=nv12,hwupload"
+            #     .run_async(
+            #         quiet=True,
+            #         pipe_stdout=True,
+            #         pipe_stderr=True,
+            #         overwrite_output=True,
+            #     )
+            # )
             jobs.append((input_file, output_file, output_file_tmp, subproc))
 
         for input_file, output_file, output_file_tmp, subproc in jobs:
@@ -185,19 +257,6 @@ def transcode(
                 succeeded += 1
                 success(f"{input_file} has finished")
                 os.rename(output_file_tmp, output_file)
-            # success(f"{input_file}")
-
-        # for input_file, subproc, (out, err) in [
-        #     (input_file, subproc, subproc.communicate()) for input_file, subproc in jobs
-        # ]:
-        #     if subproc.returncode != 0:
-        #         failed += 1
-        #         error(
-        #             # theres no proper typing for this in the impl so idk if its always present
-        #             f"Error processing {input_file}: stderr: {err.decode() if err else out.decode() if out else 'no output to display'}"
-        #         )
-        #     else:
-        #         succeeded += 1
         end = time.time()
         current_batch_time = end - start
         batch_times.append(current_batch_time)
@@ -205,10 +264,6 @@ def transcode(
         avg_batch_time_sec = sum(batch_times) / len(batch_times)
         batches_left = batch_count - batch_n
         time_left_sec = avg_batch_time_sec * batches_left
-        # avg_file_time_sec = avg_batch_time_sec / batch_size
-        # files_left = total_files - (succeeded + failed)
-        # time_left_sec = avg_file_time_sec * files_left
-
         print(
             f"completed {batch_size} files in {current_batch_time / 60} minutes\naverage rate per batch: {avg_batch_time_sec / 60} minutes\ntime left: {time_left_sec / 60} minutes"
         )
@@ -223,10 +278,10 @@ def transcode(
         return True
 
 
-def parse_command_line() -> tuple[bool, bool, str, str, int]:
+def parse_command_line() -> tuple[bool, bool, bool, str, str, str, str, int]:
     parser = argparse.ArgumentParser(
         prog="codec-convert",
-        description=f"mass converter from {SOURCE_ENCODING_HUMAN_NAME} to more efficient {TARGET_ENCODING_HUMAN_NAME} MP4 Codec",
+        description="mass converter from one video codec to another",
     )
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("-i", "--input", help="input directory", required=True)
@@ -234,7 +289,7 @@ def parse_command_line() -> tuple[bool, bool, str, str, int]:
         "-j", "--jobs", help="max ffmpeg instances to run", default=4, type=int
     )
     parser.add_argument(
-        "-s",
+        "-e",
         "--skip-existing",
         help="skip processing files if output file is already present",
         action="store_true",
@@ -245,13 +300,28 @@ def parse_command_line() -> tuple[bool, bool, str, str, int]:
         help='output directory (will produce "{output}/{input}")',
         default="./output/",
     )
+    parser.add_argument(
+        "-s", "--source", help="source codec", metavar="CODEC", required=True
+    )
+    parser.add_argument(
+        "-t", "--target", help="target codec", metavar="CODEC", required=True
+    )
+    parser.add_argument(
+        "-g",
+        "--use-gpu",
+        help="toggle hardware acceleration (less efficient encoding but faster)",
+        action="store_true",
+    )
     parsed = parser.parse_args()
 
     return (
         parsed.verbose,
         parsed.skip_existing,
+        parsed.use_gpu,
         parsed.input,
         parsed.output,
+        parsed.source,
+        parsed.target,
         parsed.jobs,
     )
 
@@ -261,8 +331,30 @@ def inspect_iter(fn: Callable[[str], None], s: str) -> str:
     return s
 
 
+def get_valid_files(
+    source_codec: str, input: str, output: str
+) -> Iterator[tuple[str, str]]:
+    return generate_output_path(
+        input,
+        output,
+        map(
+            lambda f: inspect_iter(lambda f: verbose(f"found file: {f}"), f),
+            filter_video_files(get_files(input)),
+        ),
+    )
+
+
 if __name__ == "__main__":
-    Static.VERBOSE, skip_existing, input, output, jobs = parse_command_line()
+    (
+        Static.VERBOSE,
+        skip_existing,
+        use_gpu,
+        input,
+        output,
+        source_codec,
+        target_codec,
+        jobs,
+    ) = parse_command_line()
     info(f"input := {input}\noutput := {output}")
     makedirs(
         output,
@@ -290,8 +382,9 @@ if __name__ == "__main__":
     try:
         transcode(
             valid_files_n,
+            target_codec,
             jobs,
-            filter_h264(iter(valid_files)),
+            filter_by_source_codec(source_codec, iter(valid_files)),
         )
     except KeyboardInterrupt:
         info("interrupted by user ... exiting")
